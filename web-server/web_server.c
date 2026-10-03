@@ -82,6 +82,10 @@ struct HttpResponse {
 
   void *context;
 
+  // Set for HEAD requests: the GET handler runs as usual, but body writes are
+  // dropped so only the status line and headers are sent.
+  bool discard_body;
+
   struct SocketState *socket_state;
 };
 
@@ -149,6 +153,18 @@ static bool cyctle_buffer_is_empty(const CycleBuffer *buffer) {
   return buffer->empty;
 }
 
+// Copies up to `length` chars from the front of the buffer without removing
+// them. Returns the number of chars copied.
+static size_t cyctle_buffer_peek(const CycleBuffer *buffer, char *out,
+                                 size_t length) {
+  size_t used_space = cyctle_buffer_used_space(buffer);
+  size_t count = used_space < length ? used_space : length;
+  for (size_t i = 0; i < count; i++) {
+    out[i] = buffer->buffer[(buffer->start + i) % BUFFER_SIZE];
+  }
+  return count;
+}
+
 typedef struct SocketState {
   SOCKET socket;
   unsigned long long timeout_time;
@@ -184,6 +200,13 @@ const HttpHeaders *req_get_headers(const HttpRequest *req) {
          "req_get_headers: cannot accesse headers bofore finished reading "
          "headers.");
   return req->headers;
+}
+size_t req_get_content_length(const HttpRequest *req) {
+  assert(req && "req_get_content_length: req is null.");
+  assert(req->state != HTTP_REQUEST_READING_HEADER &&
+         "req_get_content_length: cannot access content length before "
+         "finished reading headers.");
+  return req->content_length;
 }
 
 bool req_start_read(HttpRequest *req) {
@@ -325,6 +348,10 @@ size_t res_wirte(HttpResponse *res, const char *buffer, size_t length) {
 
   if (res->state != HTTP_RESPONSE_WRITING_BODY) {
     return 0;
+  }
+
+  if (res->discard_body) {
+    return length;
   }
 
   SocketState *state = res->socket_state;
@@ -593,6 +620,7 @@ static bool add_connection(WebServer *server, SOCKET connection_socket) {
       state->http_response.write_headers_index[1] = 0;
       state->http_response.write_headers_index[2] = 0;
       state->http_response.context = NULL;
+      state->http_response.discard_body = false;
       state->http_response.socket_state = state;
 
       state->timeout_time =
@@ -632,6 +660,7 @@ static void zero_socket_state(SocketState *state) {
   state->http_response.write_headers_index[1] = 0;
   state->http_response.write_headers_index[2] = 0;
   state->http_response.headers = NULL;
+  state->http_response.discard_body = false;
   state->http_response.socket_state = NULL;
   state->timeout_time = 0;
   state->server = 0;
@@ -717,17 +746,23 @@ static void send_data(SocketState *socket_state) {
     return;
   }
 
+  // Peek instead of take: send() may accept only part of the data, and the
+  // rest has to stay in the buffer for the next send.
   char temp_buffer[BUFFER_SIZE];
-  for (size_t i = 0; i < used_space; i++) {
-    cyctle_buffer_take_char(&socket_state->send_buffer, &temp_buffer[i]);
-  }
+  cyctle_buffer_peek(&socket_state->send_buffer, temp_buffer, used_space);
 
-  size_t bytes_sent = send(msg_socket, temp_buffer, used_space, 0);
-  if (SOCKET_ERROR == bytes_sent) {
+  int sent = send(msg_socket, temp_buffer, (int)used_space, 0);
+  if (SOCKET_ERROR == sent) {
     printf("Server: Error at send(): %d\n", WSAGetLastError());
     socket_state->send_state = SOCKET_SEND_FINISHED;
     socket_state->http_response.state = HTTP_RESPONSE_DONE;
     return;
+  }
+
+  size_t bytes_sent = (size_t)sent;
+  char discarded;
+  for (size_t i = 0; i < bytes_sent; i++) {
+    cyctle_buffer_take_char(&socket_state->send_buffer, &discarded);
   }
 
   if (bytes_sent == 0) {
@@ -1468,30 +1503,25 @@ static void head_func(HttpRequest *req, HttpResponse *res) {
   WebServer *server = req->socket_state->server;
 
   RequestHandlerFunc handler = NULL;
-  RequestHandlerCleanup cleanup = NULL;
   for (size_t i = 1; i < server->request_handlers_count; i++) {
     if (server->request_handlers[i].method == HTTP_GET &&
         _stricmp(server->request_handlers[i].route, req->route) == 0) {
       handler = server->request_handlers[i].handler;
-      cleanup = server->request_handlers[i].cleanup;
     }
   }
 
   assert(handler);
+  // Run the GET handler, possibly over several calls like a normal GET. Its
+  // body writes are dropped, and its context is freed by the GET cleanup that
+  // map_head registered for this route once the response is done.
+  res->discard_body = true;
   req->method = HTTP_GET;
   handler(req, res);
   req->method = HTTP_HEAD;
-
-  if (res->state == HTTP_RESPONSE_WRITING_BODY) {
-    res->state = HTTP_RESPONSE_DONE;
-  }
-
-  if (cleanup) {
-    cleanup(res->context);
-  }
 }
 
-static void map_head(WebServer *server, const char *route) {
+static void map_head(WebServer *server, const char *route,
+                     RequestHandlerCleanup cleanup) {
   server->request_handlers_count = server->request_handlers_count + 1;
   struct RouteReqHandler *temp =
       realloc(server->request_handlers,
@@ -1504,7 +1534,8 @@ static void map_head(WebServer *server, const char *route) {
   server->request_handlers[server->request_handlers_count - 1].route = route;
   server->request_handlers[server->request_handlers_count - 1].handler =
       head_func;
-  server->request_handlers[server->request_handlers_count - 1].cleanup = NULL;
+  server->request_handlers[server->request_handlers_count - 1].cleanup =
+      cleanup;
 }
 
 void web_server_map_get(WebServer *server, const char *route,
@@ -1525,7 +1556,7 @@ void web_server_map_get(WebServer *server, const char *route,
   server->request_handlers[server->request_handlers_count - 1].cleanup =
       cleanup;
   map_options_if_not_exists(server, route);
-  map_head(server, route);
+  map_head(server, route, cleanup);
 }
 void web_server_map_post(WebServer *server, const char *route,
                          void (*func)(HttpRequest *req, HttpResponse *res),
